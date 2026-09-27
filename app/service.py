@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import heapq
 import json
 import sqlite3
 import threading
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +15,7 @@ from .backup import BackupArchive, build_backup_archive
 from .config import Settings
 from .schemas import (
     AcknowledgeIn,
+    AdherenceSampleOut,
     BatchIn,
     BatchOut,
     CoincidentAlarmsIn,
@@ -30,6 +33,9 @@ from .schemas import (
     InterruptionEvidenceOut,
     SampleFactOut,
     SampleIn,
+    SamplingAdherenceIn,
+    SamplingAdherenceOut,
+    ScheduledInstantOut,
     ThresholdsOut,
     TurbidityExposureIn,
     TurbidityExposureOut,
@@ -793,6 +799,83 @@ class WaterQualityService:
             excess_integral=excess_integral,
         )
 
+    def sampling_adherence(
+        self, device_id: str, payload: SamplingAdherenceIn
+    ) -> SamplingAdherenceOut:
+        """Match the device's raw samples to a generated sampling schedule.
+
+        Planned instants start at ``from`` and repeat every
+        ``interval_seconds``, keeping only those strictly before ``to``.
+        The device's raw samples are read from one consistent read-only
+        snapshot; a sample can match an instant when its sampling time
+        lies within ``tolerance_seconds`` of it (inclusive), and each
+        sample and each instant take part in at most one match. The
+        matching first maximizes the number of matched instants, then
+        minimizes the total absolute deviation, and finally keeps the
+        lexicographically smallest matched list ordered by (scheduled
+        instant, sampled_at, sequence). The query never writes samples,
+        events, acknowledgements or change-stream rows; writes committed
+        after the snapshot are reflected by the next call.
+        """
+        with self._write_lock, db.read_transaction(self._connection):
+            samples = self._load_raw_samples(device_id)
+
+        step = timedelta(seconds=payload.interval_seconds)
+        tolerance = timedelta(seconds=payload.tolerance_seconds)
+        instants: list[datetime] = []
+        current = payload.from_
+        while current < payload.to:
+            instants.append(current)
+            current += step
+
+        # Only samples within tolerance of some planned instant can match;
+        # rank them by (instant, sequence) for the tie-breaking rules.
+        low = instants[0] - tolerance
+        high = instants[-1] + tolerance
+        usable = sorted(
+            (sample for sample in samples if low <= sample.instant <= high),
+            key=lambda sample: (sample.instant, sample.sequence),
+        )
+
+        matching = _match_scheduled_samples(instants, usable, tolerance)
+
+        schedule: list[ScheduledInstantOut] = []
+        hit_count = 0
+        for index, instant in enumerate(instants):
+            rank = matching.get(index)
+            if rank is None:
+                schedule.append(
+                    ScheduledInstantOut(scheduled_at=instant, hit=False)
+                )
+                continue
+            sample = usable[rank]
+            hit_count += 1
+            schedule.append(
+                ScheduledInstantOut(
+                    scheduled_at=instant,
+                    hit=True,
+                    sample=AdherenceSampleOut(
+                        sequence=sample.sequence,
+                        sampled_at=sample.instant,
+                        turbidity=sample.turbidity,
+                    ),
+                    deviation_seconds=(
+                        sample.instant - instant
+                    ).total_seconds(),
+                )
+            )
+
+        return SamplingAdherenceOut(
+            device_id=device_id,
+            from_=payload.from_,
+            to=payload.to,
+            interval_seconds=payload.interval_seconds,
+            tolerance_seconds=payload.tolerance_seconds,
+            scheduled_count=len(instants),
+            hit_count=hit_count,
+            schedule=schedule,
+        )
+
     def _rebuild_device(
         self, device_id: str
     ) -> tuple[dict[str, EventOut], DeviceEvents]:
@@ -1152,3 +1235,155 @@ class WaterQualityService:
     @staticmethod
     def _parse_timestamp(value: str) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+@dataclass
+class _FlowEdge:
+    """One residual-network edge; ``rev`` indexes the reverse edge."""
+
+    to: int
+    rev: int
+    cap: int
+    cost: int
+
+
+def _total_microseconds(value: timedelta) -> int:
+    return (value.days * 86_400 + value.seconds) * 1_000_000 + value.microseconds
+
+
+def _match_scheduled_samples(
+    instants: list[datetime],
+    samples: list[_RawSample],
+    tolerance: timedelta,
+) -> dict[int, int]:
+    """Optimally match planned instants to raw samples one to one.
+
+    ``samples`` must already be filtered to those within ``tolerance`` of
+    at least one instant and sorted by (sampled_at, sequence); the sample
+    index in that list is its rank. Returns a dict mapping an instant
+    index to the rank of its matched sample. The matching is the unique
+    solution of three ordered goals: maximize the number of matched
+    instants, minimize the total absolute deviation, and finally keep the
+    lexicographically smallest matched list ordered by (scheduled
+    instant, sampled_at, sequence).
+
+    All three goals are encoded in one exact integer edge cost solved by
+    min-cost max-flow. With B = m + 1 (m = number of candidate samples)
+    and n instants, edge (i, j) costs
+    ``|deviation_us| * B**n + (rank_j - m) * B**(n-1-i)``: the deviation
+    term dominates because the tertiary digits of one matching never sum
+    to B**n in absolute value, and the mixed-radix digit makes earlier
+    instants more significant, prefers a match over no match (matched
+    digits are negative) and prefers smaller (sampled_at, sequence)
+    ranks.
+    """
+    n = len(instants)
+    m = len(samples)
+    if n == 0 or m == 0:
+        return {}
+
+    # Candidate ranks per instant; tolerance is inclusive on both sides.
+    sample_instants = [sample.instant for sample in samples]
+    candidates: list[list[tuple[int, int]]] = []
+    for instant in instants:
+        lo = bisect_left(sample_instants, instant - tolerance)
+        hi = bisect_right(sample_instants, instant + tolerance)
+        row = [
+            (rank, _total_microseconds(samples[rank].instant - instant))
+            for rank in range(lo, hi)
+        ]
+        # Only the n best candidates of an instant can ever participate in
+        # an optimal matching: the other n-1 instants can take at most
+        # n-1 of them, so one always remains for a cost-free exchange.
+        row.sort(key=lambda item: (abs(item[1]), item[0]))
+        del row[n:]
+        candidates.append(row)
+
+    active = sorted({rank for row in candidates for rank, _ in row})
+    if not active:
+        return {}
+    node_of_rank = {rank: idx for idx, rank in enumerate(active)}
+
+    size = n + len(active) + 2
+    source = 0
+    sink = size - 1
+    graph: list[list[_FlowEdge]] = [[] for _ in range(size)]
+
+    def add_edge(u: int, v: int, cap: int, cost: int) -> None:
+        graph[u].append(_FlowEdge(v, len(graph[v]), cap, cost))
+        graph[v].append(_FlowEdge(u, len(graph[u]) - 1, 0, -cost))
+
+    for i in range(n):
+        add_edge(source, 1 + i, 1, 0)
+    for idx in range(len(active)):
+        add_edge(1 + n + idx, sink, 1, 0)
+
+    base = m + 1
+    scale = base**n
+    min_cost_to_sample: list[int | None] = [None] * len(active)
+    for i, row in enumerate(candidates):
+        weight = base ** (n - 1 - i)
+        for rank, deviation_us in row:
+            idx = node_of_rank[rank]
+            cost = abs(deviation_us) * scale + (rank - m) * weight
+            add_edge(1 + i, 1 + n + idx, 1, cost)
+            if (
+                min_cost_to_sample[idx] is None
+                or cost < min_cost_to_sample[idx]
+            ):
+                min_cost_to_sample[idx] = cost
+
+    # Johnson potentials of the initial graph (edges only go
+    # source -> instant -> sample -> sink) keep reduced costs
+    # non-negative, so Dijkstra applies even though edge costs may be
+    # negative; each augmentation then updates them by the reduced
+    # distances, preserving the invariant.
+    potential = [0] * size
+    for idx in range(len(active)):
+        cost = min_cost_to_sample[idx]
+        assert cost is not None
+        potential[1 + n + idx] = cost
+    potential[sink] = min(potential[1 + n + idx] for idx in range(len(active)))
+
+    # Successive shortest augmenting paths: each augmentation raises the
+    # matched count by one along a minimum-cost path, so the final flow
+    # first maximizes matches and then minimizes the encoded cost.
+    while True:
+        dist: list[int | None] = [None] * size
+        previous: list[tuple[int, int] | None] = [None] * size
+        dist[source] = 0
+        heap: list[tuple[int, int]] = [(0, source)]
+        while heap:
+            distance, u = heapq.heappop(heap)
+            known = dist[u]
+            if known is not None and distance > known:
+                continue
+            for edge_index, edge in enumerate(graph[u]):
+                if edge.cap <= 0:
+                    continue
+                reduced = distance + edge.cost + potential[u] - potential[edge.to]
+                if dist[edge.to] is None or reduced < dist[edge.to]:
+                    dist[edge.to] = reduced
+                    previous[edge.to] = (u, edge_index)
+                    heapq.heappush(heap, (reduced, edge.to))
+        if dist[sink] is None:
+            break
+        for node in range(size):
+            if dist[node] is not None:
+                potential[node] += dist[node]
+        node = sink
+        while node != source:
+            parent = previous[node]
+            assert parent is not None
+            u, edge_index = parent
+            edge = graph[u][edge_index]
+            edge.cap -= 1
+            graph[node][edge.rev].cap += 1
+            node = u
+
+    matching: dict[int, int] = {}
+    for i in range(n):
+        for edge in graph[1 + i]:
+            if 1 + n <= edge.to < 1 + n + len(active) and edge.cap == 0:
+                matching[i] = active[edge.to - (1 + n)]
+    return matching

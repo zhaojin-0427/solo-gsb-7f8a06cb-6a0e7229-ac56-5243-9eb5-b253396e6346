@@ -27,6 +27,8 @@ from .schemas import (
     EventEvidenceOut,
     EventListOut,
     EventWithAckOut,
+    SamplingAdherenceIn,
+    SamplingAdherenceOut,
     ThresholdsOut,
     TurbidityExposureIn,
     TurbidityExposureOut,
@@ -365,6 +367,45 @@ def turbidity_exposure(
     the change stream.
     """
     return service.turbidity_exposure(
+        device_id=device_id.strip(),
+        payload=payload,
+    )
+
+
+@app.post(
+    "/devices/{device_id}/sampling-adherence",
+    response_model=SamplingAdherenceOut,
+    tags=["measurements"],
+)
+def sampling_adherence(
+    device_id: str,
+    payload: SamplingAdherenceIn,
+    service: Annotated[WaterQualityService, Depends(get_service)],
+) -> SamplingAdherenceOut:
+    """
+    Match raw samples to a generated planned-sampling schedule.
+
+    The request carries a timezone-aware [from, to] window (from < to), a
+    positive integer ``interval_seconds`` and an integer
+    ``tolerance_seconds`` between 0 and ``interval_seconds``. Planned
+    instants start at ``from`` and repeat every ``interval_seconds``,
+    keeping only those strictly before ``to``; a window generating more
+    than 200 instants is rejected with 422. The device's raw samples are
+    read from one consistent read-only snapshot; a sample can match an
+    instant when its sampling time lies within ``tolerance_seconds`` of
+    it (inclusive), and each sample and each instant take part in at
+    most one match. The matching first maximizes the number of matched
+    instants, then minimizes the total absolute deviation, and finally
+    keeps the lexicographically smallest matched list ordered by
+    (scheduled instant, sampled_at, sequence). Every planned instant is
+    reported in order with its matched sample and signed deviation
+    seconds (sampled_at - scheduled_at) or, when unmatched, the miss
+    marker ``hit: false``; ``scheduled_count`` and ``hit_count``
+    summarize the schedule. Late writes and corrections are reflected by
+    the next query; the query never modifies samples, events,
+    acknowledgements or the change stream.
+    """
+    return service.sampling_adherence(
         device_id=device_id.strip(),
         payload=payload,
     )

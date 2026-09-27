@@ -132,6 +132,72 @@ class CoincidentAlarmsIn(BaseModel):
         return self
 
 
+# Maximum number of scheduled instants one sampling-adherence query may
+# generate; a window producing more is rejected with 422.
+MAX_SCHEDULED_INSTANTS = 200
+
+
+def _scheduled_instant_count(
+    from_: datetime, to: datetime, interval_seconds: int
+) -> int:
+    """Number of instants from_ + k*interval that are strictly before to.
+
+    Computed in exact integer microseconds so fractional window bounds are
+    counted without floating-point rounding.
+    """
+    span = to - from_
+    span_us = (
+        (span.days * 86_400 + span.seconds) * 1_000_000 + span.microseconds
+    )
+    step_us = interval_seconds * 1_000_000
+    return -(-span_us // step_us)  # ceil: k*step < span for k = 0..count-1
+
+
+class SamplingAdherenceIn(BaseModel):
+    """Scheduled-sampling adherence query for one device.
+
+    ``from``/``to`` bound the schedule window: both must be timezone-aware
+    and are normalized to UTC, with ``from`` strictly before ``to``.
+    ``interval_seconds`` is the positive integer spacing of the planned
+    sampling instants, generated from ``from`` and strictly before ``to``;
+    a window generating more than 200 instants is rejected.
+    ``tolerance_seconds`` is the integer matching tolerance around each
+    planned instant and ranges from 0 to ``interval_seconds``.
+    """
+
+    from_: datetime = Field(alias="from", examples=["2026-09-23T08:00:00Z"])
+    to: datetime = Field(examples=["2026-09-23T09:00:00Z"])
+    interval_seconds: int = Field(gt=0, examples=[60])
+    tolerance_seconds: int = Field(ge=0, examples=[10])
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("from_", "to")
+    @classmethod
+    def require_aware_timestamp(cls, value: datetime) -> datetime:
+        return _aware_utc_timestamp(value)
+
+    @model_validator(mode="after")
+    def validate_window_interval_and_tolerance(self) -> "SamplingAdherenceIn":
+        if self.from_ >= self.to:
+            raise ValueError("from must be before to")
+        if self.tolerance_seconds > self.interval_seconds:
+            raise ValueError(
+                "tolerance_seconds must not exceed interval_seconds"
+            )
+        if (
+            _scheduled_instant_count(
+                self.from_, self.to, self.interval_seconds
+            )
+            > MAX_SCHEDULED_INSTANTS
+        ):
+            raise ValueError(
+                "window and interval_seconds produce more than "
+                f"{MAX_SCHEDULED_INSTANTS} scheduled instants"
+            )
+        return self
+
+
 class TurbidityExposureIn(BaseModel):
     """Above-threshold turbidity exposure query for one device.
 
@@ -351,6 +417,52 @@ class TurbidityExposureOut(BaseModel):
     covered_seconds: float
     exceedance_seconds: float
     excess_integral: float
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdherenceSampleOut(BaseModel):
+    """The raw sample matched to one scheduled sampling instant."""
+
+    sequence: int
+    sampled_at: datetime
+    turbidity: float
+
+
+class ScheduledInstantOut(BaseModel):
+    """One planned sampling instant and its matching outcome.
+
+    ``hit`` is the miss marker: when it is false the instant has no
+    matching sample and both ``sample`` and ``deviation_seconds`` are
+    null. When it is true, ``sample`` is the matched raw sample and
+    ``deviation_seconds`` is the signed offset
+    (sampled_at - scheduled_at, negative when the sample is early),
+    keeping fractional seconds.
+    """
+
+    scheduled_at: datetime
+    hit: bool
+    sample: AdherenceSampleOut | None = None
+    deviation_seconds: float | None = None
+
+
+class SamplingAdherenceOut(BaseModel):
+    """How raw samples adhere to the generated sampling schedule.
+
+    ``scheduled_count`` is the number of generated instants (from ``from``
+    in steps of ``interval_seconds``, strictly before ``to``);
+    ``hit_count`` is how many of them were matched to a sample.
+    ``schedule`` lists every planned instant in chronological order.
+    """
+
+    device_id: str
+    from_: datetime = Field(alias="from")
+    to: datetime
+    interval_seconds: int
+    tolerance_seconds: int
+    scheduled_count: int
+    hit_count: int
+    schedule: list[ScheduledInstantOut]
 
     model_config = ConfigDict(populate_by_name=True)
 
