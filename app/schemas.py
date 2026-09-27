@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -163,6 +163,66 @@ class TurbidityExposureIn(BaseModel):
     def validate_window(self) -> "TurbidityExposureIn":
         if self.from_ >= self.to:
             raise ValueError("from must be before to")
+        return self
+
+
+# At most this many planned instants are generated from (from, to,
+# interval_seconds); a window needing more is rejected with 422 so the
+# matching answer stays bounded.
+MAX_PLANNED_POINTS = 200
+
+
+class SamplingAdherenceIn(BaseModel):
+    """Planned-schedule adherence query for one device.
+
+    ``from``/``to`` are timezone-aware (normalized to UTC) with
+    ``from < to``. Starting at ``from``, one planned instant is generated
+    every ``interval_seconds`` while the instant stays strictly before
+    ``to``; more than ``MAX_PLANNED_POINTS`` such instants is a 422.
+    ``interval_seconds`` is a positive integer and ``tolerance_seconds``
+    is an integer between 0 and ``interval_seconds`` inclusive; a raw
+    sample lands within a point's tolerance when
+    ``|sampled_at - planned| <= tolerance_seconds``.
+    """
+
+    from_: datetime = Field(alias="from", examples=["2026-09-23T08:00:00Z"])
+    to: datetime = Field(examples=["2026-09-23T08:10:00Z"])
+    interval_seconds: int = Field(gt=0, examples=[60])
+    tolerance_seconds: int = Field(ge=0, examples=[5])
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("from_", "to")
+    @classmethod
+    def require_aware_timestamp(cls, value: datetime) -> datetime:
+        return _aware_utc_timestamp(value)
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "SamplingAdherenceIn":
+        if self.from_ >= self.to:
+            raise ValueError("from must be before to")
+        if self.tolerance_seconds > self.interval_seconds:
+            raise ValueError(
+                "tolerance_seconds must not exceed interval_seconds"
+            )
+        # Planned instants are from + k*interval that stay strictly before
+        # to; their count is the number of k >= 0 with
+        # k*interval < (to - from), i.e. ceil(window / interval). When the
+        # window is an exact multiple, the endpoint itself is not a point.
+        # Timedeltas resolve to whole microseconds, so the integer math is
+        # exact.
+        window_microseconds = (self.to - self.from_) // timedelta(
+            microseconds=1
+        )
+        interval_microseconds = self.interval_seconds * 1_000_000
+        planned_count = (
+            window_microseconds + interval_microseconds - 1
+        ) // interval_microseconds
+        if planned_count > MAX_PLANNED_POINTS:
+            raise ValueError(
+                f"the schedule generates {planned_count} planned instants; "
+                f"at most {MAX_PLANNED_POINTS} are allowed"
+            )
         return self
 
 
@@ -351,6 +411,58 @@ class TurbidityExposureOut(BaseModel):
     covered_seconds: float
     exceedance_seconds: float
     excess_integral: float
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdherenceSampleOut(SampleFactOut):
+    """The one raw sample matched to a planned instant.
+
+    Samples are identified in the response by their (sampled_at,
+    sequence) identity: raw samples are deduplicated by
+    (device_id, sequence), but the lexicographic tie break between
+    equally good matches is defined on this pair.
+    """
+
+
+class SamplingAdherencePointOut(BaseModel):
+    """One planned instant's adherence result.
+
+    Exactly one of ``sample``/``missed`` distinguishes the cases: a hit
+    carries the matched raw sample and the signed ``deviation_seconds``
+    (the sample time minus the planned instant, so negative means early
+    and positive late); a miss carries ``missed: true`` and neither a
+    sample nor a deviation. Points are ordered by planned instant.
+    """
+
+    planned_at: datetime
+    sample: AdherenceSampleOut | None = None
+    deviation_seconds: float | None = None
+    missed: bool = False
+
+
+class SamplingAdherenceOut(BaseModel):
+    """Planned-instant adherence summary for one device.
+
+    Each planned point lists its matched raw sample with the signed
+    deviation seconds, or a missed marker. ``planned_count`` is the
+    number of generated instants (the number of points) and
+    ``hit_count`` how many of them were matched; every point and every
+    raw sample participates in the one-to-one matching at most once. The
+    matching first maximizes the number of hit points, then minimizes
+    the total absolute deviation, breaking remaining ties by the
+    lexicographically smallest match list ordered by
+    (planned_at, sampled_at, sequence).
+    """
+
+    device_id: str
+    from_: datetime = Field(alias="from")
+    to: datetime
+    interval_seconds: int
+    tolerance_seconds: int
+    planned_count: int
+    hit_count: int
+    points: list[SamplingAdherencePointOut]
 
     model_config = ConfigDict(populate_by_name=True)
 

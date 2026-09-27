@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from . import db
+from .adherence import match_schedule
 from .backup import BackupArchive, build_backup_archive
 from .config import Settings
 from .schemas import (
@@ -21,6 +22,7 @@ from .schemas import (
     CorrectionIn,
     CorrectionOut,
     DeviceEvents,
+    AdherenceSampleOut,
     EventChangeListOut,
     EventChangeOut,
     EventEvidenceOut,
@@ -30,6 +32,9 @@ from .schemas import (
     InterruptionEvidenceOut,
     SampleFactOut,
     SampleIn,
+    SamplingAdherenceIn,
+    SamplingAdherenceOut,
+    SamplingAdherencePointOut,
     ThresholdsOut,
     TurbidityExposureIn,
     TurbidityExposureOut,
@@ -791,6 +796,126 @@ class WaterQualityService:
             covered_seconds=covered_seconds,
             exceedance_seconds=exceedance_seconds,
             excess_integral=excess_integral,
+        )
+
+    def sampling_adherence(
+        self, device_id: str, payload: SamplingAdherenceIn
+    ) -> SamplingAdherenceOut:
+        """Match one device's raw samples against a planned schedule.
+
+        Planned instants are ``from + k * interval_seconds`` while strictly
+        before ``to``. The device's raw samples are read once in
+        (sampled_at, sequence) order from a single read-only snapshot and
+        matched one-to-one against the planned points when a sample lies
+        within ``tolerance_seconds`` (inclusive): every point and every
+        sample is used at most once. The matching first maximizes the
+        number of hit points, then minimizes the total absolute deviation
+        in seconds, and finally takes the lexicographically smallest match
+        list ordered by (planned_at, sampled_at, sequence). Each point
+        returns its matched sample with the signed deviation seconds
+        (negative early, positive late) or a missed marker. The query
+        never writes samples, events, acknowledgements or change-stream
+        rows; late writes or corrections are reflected by the next call.
+        """
+        interval_us = payload.interval_seconds * 1_000_000
+        tolerance_us = payload.tolerance_seconds * 1_000_000
+        window_start = payload.from_
+        window_end = payload.to
+        start_us = self._epoch_microseconds(window_start)
+        end_us = self._epoch_microseconds(window_end)
+        planned_us = self._planned_instants(
+            start_us, end_us, interval_us
+        )
+
+        with self._write_lock, db.read_transaction(self._connection):
+            raw_samples = self._load_raw_samples(device_id)
+
+        samples = sorted(
+            (
+                (self._epoch_microseconds(sample.instant), sample.sequence,
+                 sample.turbidity)
+                for sample in raw_samples
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        # Only samples within tolerance of some planned point can ever
+        # match; drop the device's unrelated history before the alignment.
+        earliest = planned_us[0] - tolerance_us
+        latest = planned_us[-1] + tolerance_us
+        samples = [
+            sample
+            for sample in samples
+            if earliest <= sample[0] <= latest
+        ]
+        matches = match_schedule(
+            samples,
+            planned_us,
+            tolerance_us=tolerance_us,
+        )
+        by_plan = {match.plan_index: match for match in matches}
+
+        points: list[SamplingAdherencePointOut] = []
+        for index, planned_value in enumerate(planned_us):
+            planned_at = self._instant_from_microseconds(planned_value)
+            match = by_plan.get(index)
+            if match is None:
+                points.append(
+                    SamplingAdherencePointOut(planned_at=planned_at, missed=True)
+                )
+            else:
+                points.append(
+                    SamplingAdherencePointOut(
+                        planned_at=planned_at,
+                        sample=AdherenceSampleOut(
+                            sequence=match.sequence,
+                            sampled_at=self._instant_from_microseconds(
+                                match.instant_us
+                            ),
+                            turbidity=match.turbidity,
+                        ),
+                        deviation_seconds=match.deviation_us / 1_000_000.0,
+                    )
+                )
+
+        return SamplingAdherenceOut(
+            device_id=device_id,
+            from_=window_start,
+            to=window_end,
+            interval_seconds=payload.interval_seconds,
+            tolerance_seconds=payload.tolerance_seconds,
+            planned_count=len(planned_us),
+            hit_count=len(matches),
+            points=points,
+        )
+
+    @staticmethod
+    def _planned_instants(
+        start_us: int, end_us: int, interval_us: int
+    ) -> list[int]:
+        """Planned instants start + k*interval strictly before end."""
+        points: list[int] = []
+        instant = start_us
+        while instant < end_us:
+            points.append(instant)
+            instant += interval_us
+        return points
+
+    @staticmethod
+    def _epoch_microseconds(value: datetime) -> int:
+        # Exact integer microseconds since the UTC epoch; avoids any float
+        # drift in the tolerance comparisons.
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        delta = value.astimezone(timezone.utc) - epoch
+        return (
+            delta.days * 86_400 * 1_000_000
+            + delta.seconds * 1_000_000
+            + delta.microseconds
+        )
+
+    @staticmethod
+    def _instant_from_microseconds(value: int) -> datetime:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(
+            microseconds=value
         )
 
     def _rebuild_device(

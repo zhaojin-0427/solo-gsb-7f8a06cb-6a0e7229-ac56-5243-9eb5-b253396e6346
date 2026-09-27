@@ -27,6 +27,8 @@ from .schemas import (
     EventEvidenceOut,
     EventListOut,
     EventWithAckOut,
+    SamplingAdherenceIn,
+    SamplingAdherenceOut,
     ThresholdsOut,
     TurbidityExposureIn,
     TurbidityExposureOut,
@@ -365,6 +367,40 @@ def turbidity_exposure(
     the change stream.
     """
     return service.turbidity_exposure(
+        device_id=device_id.strip(),
+        payload=payload,
+    )
+
+
+@app.post(
+    "/devices/{device_id}/sampling-adherence",
+    response_model=SamplingAdherenceOut,
+    tags=["measurements"],
+)
+def sampling_adherence(
+    device_id: str,
+    payload: SamplingAdherenceIn,
+    service: Annotated[WaterQualityService, Depends(get_service)],
+) -> SamplingAdherenceOut:
+    """
+    Match the device's raw samples against a planned sampling schedule.
+
+    The request carries a timezone-aware [from, to) window (from < to), a
+    positive integer interval_seconds and an integer tolerance_seconds
+    between 0 and interval_seconds. Planned instants are generated at
+    from + k*interval strictly before to; more than 200 such instants is
+    rejected with 422. The device's raw samples are read once from a
+    single read-only snapshot and each sample is matched at most once to
+    at most one planned point when it lies within the point's inclusive
+    tolerance. The matching maximizes the number of hit points first,
+    minimizes the total absolute deviation second, and breaks remaining
+    ties by the lexicographically smallest match list ordered by
+    (planned_at, sampled_at, sequence). Every point returns its hit
+    sample with the signed deviation seconds or a missed marker, together
+    with the planned and hit counts. The query is read-only and never
+    touches samples, events, acknowledgements or the change stream.
+    """
+    return service.sampling_adherence(
         device_id=device_id.strip(),
         payload=payload,
     )
